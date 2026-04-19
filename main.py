@@ -777,7 +777,12 @@ def discover_vendors(req: DiscoverVendorsRequest):
                 }
                 # GLD-21: only the first vendor gets the real call. Others get
                 # synthetic outreach state so the demo dashboard looks alive.
-                if idx > 0:
+                if idx == 0:
+                    # Pin the real test phone so the UI shows it and the call button dials it.
+                    contact = dict(row.get("contact") or {})
+                    contact["phone"] = HARDCODED_VENDOR_PHONE
+                    row["contact"] = contact
+                else:
                     _populate_dummy_vendor(row, req)
                 sb.table("vendors").upsert(row).execute()
                 vendors_out.append(row)
