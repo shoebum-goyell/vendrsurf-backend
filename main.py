@@ -1,7 +1,7 @@
 import json
 import os
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from anthropic import Anthropic
@@ -48,7 +48,7 @@ Return ONLY a JSON object with these keys (use null if truly unknown):
 - location: ISO3 country code (e.g. "USA", "IND", "DEU")
 - product_category: short noun phrase describing what is being sourced
 - quantity: integer units
-- budget_min: integer USD (lower bound of target price, total or per-unit — infer from context)
+- budget_min: integer USD (lower bound of target price)
 - budget_max: integer USD (upper bound)
 - timeline_weeks: integer weeks until delivery needed
 
@@ -77,8 +77,7 @@ def parse_rfq(req: ParseRfqRequest):
             if raw.startswith("json"):
                 raw = raw[4:]
             raw = raw.strip()
-        fields = json.loads(raw)
-        return {"fields": fields}
+        return {"fields": json.loads(raw)}
     except json.JSONDecodeError as e:
         return {"error": "parse", "message": f"model did not return JSON: {e}"}
     except Exception as e:
@@ -98,34 +97,65 @@ CRUST_HEADERS = {
     "Content-Type": "application/json",
 }
 
-POC_TITLE_KEYWORDS = ["procurement", "supply", "sourcing"]
+POC_TITLE_KEYWORDS = ("procurement", "supply", "sourcing", "purchasing", "buyer")
 
 
-def crust_company_search(client: httpx.Client, query: str, country: Optional[str]):
-    payload: dict = {"query": query, "limit": 10}
+def _leaf(field: str, op: str, value: Any) -> dict:
+    return {"field": field, "type": op, "value": value, "op": "and", "conditions": []}
+
+
+def _group(conditions: list, op: str = "and") -> dict:
+    return {"field": "", "type": "", "value": "", "op": op, "conditions": conditions}
+
+
+def crust_company_search(client: httpx.Client, category: str, country: Optional[str]) -> list:
+    conds = [_leaf("taxonomy.categories", "(.)", category)]
     if country:
-        payload["filters"] = {"hq_country": country}
+        conds.append(_leaf("locations.country", "=", country))
+    payload = {"filters": _group(conds), "limit": 10}
     r = client.post(f"{CRUST_BASE}/company/search", json=payload, headers=CRUST_HEADERS, timeout=30.0)
     r.raise_for_status()
-    data = r.json()
-    return data.get("results") or data.get("companies") or []
+    return r.json().get("companies", [])
 
 
-def crust_person_search(client: httpx.Client, company_id: str):
+def crust_person_search_for_company(client: httpx.Client, company_id: int) -> list:
     payload = {
-        "filters": {
-            "crustdata_company_id": company_id,
-            "title_contains_any": POC_TITLE_KEYWORDS,
-        },
-        "limit": 3,
+        "filters": _group([
+            _leaf("experience.employment_details.company_id", "=", company_id),
+        ]),
+        "limit": 10,
     }
     try:
         r = client.post(f"{CRUST_BASE}/person/search", json=payload, headers=CRUST_HEADERS, timeout=30.0)
         r.raise_for_status()
-        data = r.json()
-        return data.get("results") or data.get("people") or []
+        return r.json().get("profiles", [])
     except Exception:
         return []
+
+
+def pick_poc(profiles: list, company_id: int) -> Optional[dict]:
+    best = None
+    for p in profiles:
+        current = (p.get("experience", {}).get("employment_details", {}).get("current") or [])
+        active_at_co = any(e.get("crustdata_company_id") == company_id for e in current)
+        if not active_at_co:
+            continue
+        title = (p.get("basic_profile", {}).get("current_title") or "").lower()
+        if any(k in title for k in POC_TITLE_KEYWORDS):
+            return _format_poc(p)
+        if best is None:
+            best = p
+    return _format_poc(best) if best else None
+
+
+def _format_poc(p: dict) -> dict:
+    bp = p.get("basic_profile", {}) or {}
+    social = p.get("social_handles", {}) or {}
+    return {
+        "name": bp.get("name"),
+        "title": bp.get("current_title"),
+        "linkedin": (social.get("professional_network_identifier") or {}).get("profile_url"),
+    }
 
 
 @app.post("/discover-vendors")
@@ -145,29 +175,20 @@ def discover_vendors(req: DiscoverVendorsRequest):
 
             vendors_out = []
             for c in companies:
-                company_id = str(c.get("id") or c.get("crustdata_company_id") or "")
-                name = c.get("name") or c.get("company_name") or "Unknown"
-                location = c.get("hq_country") or c.get("country") or c.get("location") or None
-                employees = c.get("employee_count") or c.get("headcount") or None
+                basic = c.get("basic_info", {}) or {}
+                loc = c.get("locations", {}) or {}
+                headcount = c.get("headcount", {}) or {}
+                company_id = c.get("crustdata_company_id")
 
-                pocs = crust_person_search(client, company_id) if company_id else []
-                contact = None
-                if pocs:
-                    p = pocs[0]
-                    contact = {
-                        "name": p.get("name") or p.get("full_name"),
-                        "title": p.get("title"),
-                        "email": p.get("email"),
-                        "linkedin": p.get("linkedin_url"),
-                    }
+                profiles = crust_person_search_for_company(client, company_id) if company_id else []
+                contact = pick_poc(profiles, company_id) if profiles else None
 
-                vendor_id = f"v-{uuid.uuid4().hex[:12]}"
                 row = {
-                    "id": vendor_id,
+                    "id": f"v-{uuid.uuid4().hex[:12]}",
                     "rfq_id": req.rfq_id,
-                    "name": name,
-                    "location": location,
-                    "employees": str(employees) if employees is not None else None,
+                    "name": basic.get("name") or "Unknown",
+                    "location": loc.get("country"),
+                    "employees": str(headcount.get("total")) if headcount.get("total") is not None else basic.get("employee_count_range"),
                     "contact": contact,
                     "status": "discovered",
                 }
