@@ -787,6 +787,25 @@ def discover_vendors(req: DiscoverVendorsRequest):
                 sb.table("vendors").upsert(row).execute()
                 vendors_out.append(row)
 
+            # GLD-21: auto-trigger the real Vapi call on vendor #0 now that all rows are seeded.
+            if vendors_out and VAPI_ASSISTANT_ID:
+                vendor0 = vendors_out[0]
+                try:
+                    rfq_resp = sb.table("rfqs").select("*").eq("id", req.rfq_id).limit(1).execute()
+                    rfq_row = rfq_resp.data[0] if rfq_resp.data else {}
+                    variables = _build_call_variables(rfq_row, vendor0)
+                    metadata = {"rfq_id": req.rfq_id, "vendor_id": vendor0["id"]}
+                    trigger_call(
+                        assistant_id=VAPI_ASSISTANT_ID,
+                        vendor_phone=HARDCODED_VENDOR_PHONE,
+                        variables=variables,
+                        metadata=metadata,
+                    )
+                    sb.table("vendors").update({"status": "calling"}).eq("id", vendor0["id"]).execute()
+                    vendors_out[0]["status"] = "calling"
+                except Exception:
+                    pass  # don't fail discovery if auto-call fails
+
             return {
                 "vendors": vendors_out,
                 "search_plan": {**plan, "headcount_range": list(headcount) if headcount else None},
