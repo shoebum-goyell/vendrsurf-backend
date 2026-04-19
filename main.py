@@ -1,10 +1,8 @@
-import json
 import os
 import uuid
 from typing import Any, Optional
 
 import httpx
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +11,6 @@ from supabase import Client, create_client
 
 load_dotenv()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CRUST_DATA_API_KEY = os.getenv("CRUST_DATA_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -29,59 +26,15 @@ app.add_middleware(
 )
 
 
-def anthropic_client() -> Anthropic:
-    return Anthropic(api_key=ANTHROPIC_API_KEY)
-
-
 def supabase_client() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return None
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-class ParseRfqRequest(BaseModel):
-    text: str
-
-
-PARSE_SYSTEM = """You extract structured procurement fields from a buyer's natural-language RFQ description.
-Return ONLY a JSON object with these keys (use null if truly unknown):
-- location: ISO3 country code (e.g. "USA", "IND", "DEU")
-- product_category: short noun phrase describing what is being sourced
-- quantity: integer units
-- budget_min: integer USD (lower bound of target price)
-- budget_max: integer USD (upper bound)
-- timeline_weeks: integer weeks until delivery needed
-
-No prose, no markdown fences. JSON only."""
-
-
 @app.get("/")
 def health():
     return {"ok": True, "service": "vendrsurf-backend"}
-
-
-@app.post("/parse-rfq")
-def parse_rfq(req: ParseRfqRequest):
-    if not ANTHROPIC_API_KEY:
-        return {"error": "config", "message": "ANTHROPIC_API_KEY not set"}
-    try:
-        msg = anthropic_client().messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
-            system=PARSE_SYSTEM,
-            messages=[{"role": "user", "content": req.text}],
-        )
-        raw = msg.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        return {"fields": json.loads(raw)}
-    except json.JSONDecodeError as e:
-        return {"error": "parse", "message": f"model did not return JSON: {e}"}
-    except Exception as e:
-        return {"error": "upstream", "message": str(e)}
 
 
 class DiscoverVendorsRequest(BaseModel):

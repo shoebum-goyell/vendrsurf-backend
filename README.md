@@ -1,10 +1,9 @@
 # vendrsurf-backend
 
-FastAPI backend for VendrSurf. Hosts Anthropic parse, Crust Data vendor discovery, and (future) phone-call webhook handlers.
+FastAPI backend for VendrSurf. Hosts Crust Data vendor discovery and (future) phone-call webhook handlers.
 
 ## Endpoints
 
-- `POST /parse-rfq` — `{text}` → `{fields}` (location ISO3, product_category, quantity, budget_min, budget_max, timeline_weeks)
 - `POST /discover-vendors` — `{rfq_id, location, product_category}` → `{vendors}`. Searches Crust Data companies (HQ-country filter, global fallback if <3), finds procurement POCs, upserts into Supabase `vendors`.
 
 ## Run locally
@@ -17,4 +16,4 @@ uvicorn main:app --reload
 
 ## Deploy (Railway)
 
-Uses `Procfile`. Set env vars: `ANTHROPIC_API_KEY`, `CRUST_DATA_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
+Uses `Procfile`. Set env vars: `CRUST_DATA_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
