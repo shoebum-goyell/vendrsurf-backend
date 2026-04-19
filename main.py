@@ -1,8 +1,10 @@
+import json
 import os
 import uuid
 from typing import Any, Optional
 
 import httpx
+from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +13,7 @@ from supabase import Client, create_client
 
 load_dotenv()
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CRUST_DATA_API_KEY = os.getenv("CRUST_DATA_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -32,6 +35,12 @@ def supabase_client() -> Optional[Client]:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
+def anthropic_client() -> Optional[Anthropic]:
+    if not ANTHROPIC_API_KEY:
+        return None
+    return Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
 @app.get("/")
 def health():
     return {"ok": True, "service": "vendrsurf-backend"}
@@ -41,6 +50,10 @@ class DiscoverVendorsRequest(BaseModel):
     rfq_id: str
     location: Optional[str] = None
     product_category: str
+    quantity: Optional[int] = None
+    budget_min: Optional[float] = None
+    budget_max: Optional[float] = None
+    timeline_weeks: Optional[int] = None
 
 
 CRUST_BASE = "https://api.crustdata.com"
@@ -50,7 +63,53 @@ CRUST_HEADERS = {
     "Content-Type": "application/json",
 }
 
-POC_TITLE_KEYWORDS = ("procurement", "supply", "sourcing", "purchasing", "buyer")
+SEARCH_PLAN_PROMPT = """You help a procurement tool find suppliers on Crust Data.
+
+Given an RFQ, return strict JSON with two arrays:
+- "keywords": 2-4 short Crust Data taxonomy-style terms for company search (broad industry/category terms, not product SKUs). Example: for "custom PCBs" -> ["PCB", "printed circuit board", "electronics manufacturing"].
+- "roles": 3-5 job title fragments for procurement POCs at suppliers. Example: ["Procurement", "Sourcing", "Supply Chain", "Buyer", "Purchasing"].
+
+Return only JSON, no prose. Keep terms lowercase.
+
+RFQ:
+{rfq}
+"""
+
+
+def build_search_plan(rfq: DiscoverVendorsRequest) -> dict:
+    fallback = {
+        "keywords": [rfq.product_category],
+        "roles": ["procurement", "supply", "sourcing", "purchasing", "buyer"],
+    }
+    client = anthropic_client()
+    if client is None:
+        return fallback
+    rfq_text = json.dumps({
+        "product_category": rfq.product_category,
+        "location": rfq.location,
+        "quantity": rfq.quantity,
+        "budget_min": rfq.budget_min,
+        "budget_max": rfq.budget_max,
+        "timeline_weeks": rfq.timeline_weeks,
+    })
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": SEARCH_PLAN_PROMPT.format(rfq=rfq_text)}],
+        )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1].rsplit("```", 1)[0]
+        plan = json.loads(text)
+        kws = [str(k).strip().lower() for k in plan.get("keywords") or [] if str(k).strip()]
+        roles = [str(r).strip().lower() for r in plan.get("roles") or [] if str(r).strip()]
+        return {
+            "keywords": kws or fallback["keywords"],
+            "roles": roles or fallback["roles"],
+        }
+    except Exception:
+        return fallback
 
 
 def _leaf(field: str, op: str, value: Any) -> dict:
@@ -61,14 +120,36 @@ def _group(conditions: list, op: str = "and") -> dict:
     return {"field": "", "type": "", "value": "", "op": op, "conditions": conditions}
 
 
-def crust_company_search(client: httpx.Client, category: str, country: Optional[str]) -> list:
-    conds = [_leaf("taxonomy.categories", "(.)", category)]
+def crust_company_search(client: httpx.Client, keyword: str, country: Optional[str]) -> list:
+    conds = [_leaf("taxonomy.categories", "(.)", keyword)]
     if country:
         conds.append(_leaf("locations.country", "=", country))
     payload = {"filters": _group(conds), "limit": 10}
     r = client.post(f"{CRUST_BASE}/company/search", json=payload, headers=CRUST_HEADERS, timeout=30.0)
     r.raise_for_status()
     return r.json().get("companies", [])
+
+
+def search_companies_multi(client: httpx.Client, keywords: list, country: Optional[str]) -> list:
+    seen: dict = {}
+    for kw in keywords:
+        try:
+            for c in crust_company_search(client, kw, country):
+                cid = c.get("crustdata_company_id")
+                if cid and cid not in seen:
+                    seen[cid] = c
+        except Exception:
+            continue
+    if len(seen) < 3 and country:
+        for kw in keywords:
+            try:
+                for c in crust_company_search(client, kw, None):
+                    cid = c.get("crustdata_company_id")
+                    if cid and cid not in seen:
+                        seen[cid] = c
+            except Exception:
+                continue
+    return list(seen.values())[:10]
 
 
 def crust_person_search_for_company(client: httpx.Client, company_id: int) -> list:
@@ -86,7 +167,7 @@ def crust_person_search_for_company(client: httpx.Client, company_id: int) -> li
         return []
 
 
-def pick_poc(profiles: list, company_id: int) -> Optional[dict]:
+def pick_poc(profiles: list, company_id: int, roles: list) -> Optional[dict]:
     best = None
     for p in profiles:
         current = (p.get("experience", {}).get("employment_details", {}).get("current") or [])
@@ -94,7 +175,7 @@ def pick_poc(profiles: list, company_id: int) -> Optional[dict]:
         if not active_at_co:
             continue
         title = (p.get("basic_profile", {}).get("current_title") or "").lower()
-        if any(k in title for k in POC_TITLE_KEYWORDS):
+        if any(r in title for r in roles):
             return _format_poc(p)
         if best is None:
             best = p
@@ -119,12 +200,13 @@ def discover_vendors(req: DiscoverVendorsRequest):
     if sb is None:
         return {"error": "config", "message": "Supabase not configured"}
 
+    plan = build_search_plan(req)
+    keywords = plan["keywords"]
+    roles = plan["roles"]
+
     try:
         with httpx.Client() as client:
-            companies = crust_company_search(client, req.product_category, req.location)
-            if len(companies) < 3 and req.location:
-                companies = crust_company_search(client, req.product_category, None)
-            companies = companies[:10]
+            companies = search_companies_multi(client, keywords, req.location)
 
             vendors_out = []
             for c in companies:
@@ -134,7 +216,7 @@ def discover_vendors(req: DiscoverVendorsRequest):
                 company_id = c.get("crustdata_company_id")
 
                 profiles = crust_person_search_for_company(client, company_id) if company_id else []
-                contact = pick_poc(profiles, company_id) if profiles else None
+                contact = pick_poc(profiles, company_id, roles) if profiles else None
 
                 row = {
                     "id": f"v-{uuid.uuid4().hex[:12]}",
@@ -148,7 +230,7 @@ def discover_vendors(req: DiscoverVendorsRequest):
                 sb.table("vendors").upsert(row).execute()
                 vendors_out.append(row)
 
-            return {"vendors": vendors_out}
+            return {"vendors": vendors_out, "search_plan": plan}
     except httpx.HTTPStatusError as e:
         return {"error": "upstream", "message": f"Crust Data {e.response.status_code}: {e.response.text[:200]}"}
     except Exception as e:

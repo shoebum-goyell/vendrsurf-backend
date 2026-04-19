@@ -4,7 +4,7 @@ FastAPI backend for VendrSurf. Hosts Crust Data vendor discovery and (future) ph
 
 ## Endpoints
 
-- `POST /discover-vendors` — `{rfq_id, location, product_category}` → `{vendors}`. Searches Crust Data companies (HQ-country filter, global fallback if <3), finds procurement POCs, upserts into Supabase `vendors`.
+- `POST /discover-vendors` — `{rfq_id, location, product_category, quantity?, budget_min?, budget_max?, timeline_weeks?}` → `{vendors, search_plan}`. Uses Claude (haiku) to derive Crust Data company keywords + procurement role patterns from the RFQ, searches Crust Data companies per-keyword (HQ-country filter, global fallback if <3 total), finds POCs whose titles match the role patterns, upserts into Supabase `vendors`.
 
 ## Run locally
 
@@ -16,4 +16,4 @@ uvicorn main:app --reload
 
 ## Deploy (Railway)
 
-Uses `Procfile`. Set env vars: `CRUST_DATA_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
+Uses `Procfile`. Set env vars: `ANTHROPIC_API_KEY`, `CRUST_DATA_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
