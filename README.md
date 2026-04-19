@@ -4,7 +4,7 @@ FastAPI backend for VendrSurf. Hosts Crust Data vendor discovery and (future) ph
 
 ## Endpoints
 
-- `POST /discover-vendors` — `{rfq_id, location, product_category, quantity?, budget_min?, budget_max?, timeline_weeks?}` → `{vendors, search_plan}`. Uses Claude (haiku) to derive Crust Data company keywords + procurement role patterns from the RFQ, searches Crust Data companies per-keyword (HQ-country filter, global fallback if <3 total), finds POCs whose titles match the role patterns, upserts into Supabase `vendors`.
+- `POST /discover-vendors` — `{rfq_id, location, product_category, quantity?, budget_min?, budget_max?, timeline_weeks?}` → `{vendors, search_plan}`. Uses Claude (sonnet) to derive `{categories[], specialities[], title_keywords[]}` from the RFQ. Searches Crust Data companies by specialities then categories (HQ-country filter, headcount range derived from `quantity`, progressive fallback if <3 total). Person search filters by current-title keywords at company level; POCs ranked by title match + business-email availability. Upserts into Supabase `vendors`.
 
 ## Run locally
 
