@@ -19,6 +19,11 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CRUST_DATA_API_KEY = os.getenv("CRUST_DATA_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
+
+# GLD-18: hard-coded test number for the entire end-to-end demo flow.
+# All outbound calls go here regardless of vendor contact details.
+HARDCODED_VENDOR_PHONE = "+16506915431"
 
 app = FastAPI(title="vendrsurf-backend")
 
@@ -409,6 +414,129 @@ class CallResponse(BaseModel):
     message: str = "Call initiated successfully"
 
 
+class CallVendorRequest(BaseModel):
+    rfq_id: str
+    vendor_id: str
+
+
+# Spoken-form helpers — Vapi assistant reads these out loud, so digits/units
+# need to be phrased naturally.
+_NUM_WORDS = {
+    0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+    6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+}
+
+
+def _qty_phrase(qty: Optional[int], uom: Optional[str]) -> str:
+    if qty is None:
+        return "an unspecified quantity"
+    if qty < 11:
+        word = _NUM_WORDS[qty]
+    elif qty < 1000:
+        word = f"{qty}"
+    elif qty < 1_000_000:
+        word = f"{qty / 1000:.1f}".rstrip("0").rstrip(".") + " thousand"
+    else:
+        word = f"{qty / 1_000_000:.1f}".rstrip("0").rstrip(".") + " million"
+    unit = uom or "units"
+    return f"{word} {unit}"
+
+
+def _eau_phrase(qty: Optional[int], uom: Optional[str], recurring: bool) -> str:
+    if qty is None:
+        return "ongoing volume to be confirmed"
+    base = _qty_phrase(qty, uom)
+    return f"around {base} per year" if recurring else f"a one-time order of {base}"
+
+
+def _rfq_one_liner(rfq: dict) -> str:
+    desc = rfq.get("product_description") or rfq.get("product_category") or rfq.get("title") or "a custom part"
+    return desc
+
+
+def _key_constraint(rfq: dict) -> str:
+    parts = []
+    if rfq.get("tolerance"):
+        parts.append(f"tolerance of {rfq['tolerance']}")
+    if rfq.get("finish"):
+        parts.append(f"finish: {rfq['finish']}")
+    if rfq.get("max_lead_time_days"):
+        parts.append(f"delivery within {rfq['max_lead_time_days']} days")
+    elif rfq.get("timeline_weeks"):
+        parts.append(f"delivery within {rfq['timeline_weeks']} weeks")
+    if rfq.get("target_unit_price"):
+        parts.append(f"target unit price around {rfq['target_unit_price']} dollars")
+    return "; ".join(parts) or "standard commercial terms"
+
+
+def _build_call_variables(rfq: dict, vendor: dict) -> dict[str, str]:
+    contact = vendor.get("contact") or {}
+    contact_first_name = (contact.get("name") or "there").split()[0] if contact.get("name") else "there"
+    certs = rfq.get("certifications") or []
+    certs_phrase = ", ".join(certs) if certs else "none"
+    buyer_name = rfq.get("workspace_name") or "VendrSurf"
+    buyer_email_raw = rfq.get("current_user_email") or "team@vendrsurf.com"
+    # Spoken email: replace @ with " at " and . with " dot "
+    buyer_email_spoken = buyer_email_raw.replace("@", " at ").replace(".", " dot ")
+
+    return {
+        "buyer_company": buyer_name,
+        "buyer_one_liner": f"{buyer_name} is sourcing {rfq.get('product_category') or 'custom manufacturing'}.",
+        "vendor_company": vendor.get("name") or "your company",
+        "contact_first_name": contact_first_name,
+        "rfq_one_liner": _rfq_one_liner(rfq),
+        "preferred_process": rfq.get("product_category") or "manufacturing",
+        "preferred_material": rfq.get("material") or "to be discussed",
+        "target_quantity_phrase": _qty_phrase(rfq.get("quantity"), rfq.get("unit_of_measure")),
+        "eau_phrase": _eau_phrase(rfq.get("quantity"), rfq.get("unit_of_measure"), bool(rfq.get("recurring"))),
+        "key_constraint": _key_constraint(rfq),
+        "required_certifications": certs_phrase,
+        "email_followup_contact": buyer_email_spoken,
+    }
+
+
+@app.post("/api/call-vendor", response_model=CallResponse)
+def call_vendor(req: CallVendorRequest) -> CallResponse:
+    if not VAPI_ASSISTANT_ID:
+        raise HTTPException(status_code=500, detail="VAPI_ASSISTANT_ID not set")
+    sb = supabase_client()
+    if sb is None:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    rfq_resp = sb.table("rfqs").select("*").eq("id", req.rfq_id).limit(1).execute()
+    if not rfq_resp.data:
+        raise HTTPException(status_code=404, detail=f"rfq {req.rfq_id} not found")
+    vendor_resp = sb.table("vendors").select("*").eq("id", req.vendor_id).limit(1).execute()
+    if not vendor_resp.data:
+        raise HTTPException(status_code=404, detail=f"vendor {req.vendor_id} not found")
+
+    rfq = rfq_resp.data[0]
+    vendor = vendor_resp.data[0]
+    variables = _build_call_variables(rfq, vendor)
+    metadata = {"rfq_id": req.rfq_id, "vendor_id": req.vendor_id}
+
+    try:
+        result = trigger_call(
+            assistant_id=VAPI_ASSISTANT_ID,
+            vendor_phone=HARDCODED_VENDOR_PHONE,
+            variables=variables,
+            metadata=metadata,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Vapi API error: {e}")
+
+    call_id = result.get("id", "unknown")
+    try:
+        sb.table("vendors").update({"status": "calling"}).eq("id", req.vendor_id).execute()
+    except Exception:
+        pass
+    return CallResponse(call_id=call_id)
+
+
 @app.post("/api/call", response_model=CallResponse)
 def make_call(req: CallRequest) -> CallResponse:
     variables = {
@@ -435,7 +563,7 @@ def make_call(req: CallRequest) -> CallResponse:
     try:
         result = trigger_call(
             assistant_id=req.assistant_id,
-            vendor_phone=req.vendor_phone,
+            vendor_phone=HARDCODED_VENDOR_PHONE,
             variables=variables,
             metadata=metadata,
         )
@@ -454,10 +582,82 @@ async def vapi_webhook(request: Request) -> dict[str, Any]:
     result = handle_webhook(payload)
     if result is None:
         return {"received": True}
+    _persist_call_event(payload, result)
     callback_url = _extract_callback_url(payload)
     if callback_url:
         await _forward_to_callback(callback_url, result)
     return {"received": True, "event": result.get("event")}
+
+
+def _persist_call_event(payload: dict[str, Any], result: dict[str, Any]) -> None:
+    sb = supabase_client()
+    if sb is None:
+        return
+    event = result.get("event")
+    row = {
+        "call_id": result.get("call_id"),
+        "rfq_id": result.get("rfq_id"),
+        "vendor_id": result.get("vendor_id"),
+        "event_type": event,
+        "status": result.get("status"),
+        "payload": result,
+        "raw": payload,
+    }
+    try:
+        sb.table("call_events").insert(row).execute()
+    except Exception:
+        pass
+
+    vendor_id = result.get("vendor_id")
+    if not vendor_id:
+        return
+    if event == "status_update":
+        status = result.get("status")
+        if status:
+            try:
+                sb.table("vendors").update({"status": _map_call_status(status)}).eq("id", vendor_id).execute()
+            except Exception:
+                pass
+    elif event == "call_complete":
+        update: dict[str, Any] = {"status": "completed"}
+        low = result.get("vendor_ballpark_unit_price_low")
+        high = result.get("vendor_ballpark_unit_price_high")
+        if low is not None and high is not None:
+            update["unit_price"] = (float(low) + float(high)) / 2
+        elif low is not None:
+            update["unit_price"] = float(low)
+        elif high is not None:
+            update["unit_price"] = float(high)
+        lead = result.get("vendor_lead_time_production_weeks") or result.get("vendor_lead_time_first_article_weeks")
+        if lead is not None:
+            try:
+                update["lead_time"] = int(lead)
+            except (ValueError, TypeError):
+                pass
+        if result.get("vendor_moq") is not None:
+            try:
+                update["moq"] = int(result["vendor_moq"])
+            except (ValueError, TypeError):
+                pass
+        if result.get("outcome"):
+            update["call_outcome"] = result["outcome"]
+        if result.get("summary"):
+            update["summary"] = result["summary"]
+        if result.get("duration_seconds") is not None:
+            update["call_duration"] = f"{int(result['duration_seconds'])}s"
+        try:
+            sb.table("vendors").update(update).eq("id", vendor_id).execute()
+        except Exception:
+            pass
+
+
+def _map_call_status(vapi_status: str) -> str:
+    # vapi: queued | ringing | in-progress | forwarding | ended
+    if vapi_status in ("queued", "ringing", "in-progress", "forwarding"):
+        return "calling"
+    if vapi_status == "ended":
+        return "completed"
+    return "calling"
 
 
 def _extract_callback_url(payload: dict[str, Any]) -> Optional[str]:
