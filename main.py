@@ -46,6 +46,116 @@ def health():
     return {"ok": True, "service": "vendrsurf-backend"}
 
 
+class ParseRFQRequest(BaseModel):
+    transcript: str
+
+
+PARSE_RFQ_PROMPT = """You extract structured RFQ fields from a procurement buyer's voice transcript. The output feeds a voice-AI that will negotiate with vendors, so precision matters — never guess.
+
+Return strict JSON with exactly these keys. Use null for anything not stated.
+
+Extraction rules per field:
+- product_description (string): free-text spec — grade, dimensions, material, tolerances. Extract VERBATIM from the buyer's words; do NOT summarize or paraphrase. This is the #1 anchor for any quote.
+- product_category (string): short category label for Crust Data search (e.g. "CNC-machined aluminum enclosures", "custom PCBs", "plastic bottles"). Infer from product_description if not said directly.
+- location (string): country the RFQ is sourced from (3-letter ISO code like "USA", "IND", "CHN") if stated.
+- quantity (integer): numeric quantity.
+- unit_of_measure (string, one of: units | kg | tons | meters | liters | pieces): pairs with quantity. Infer from product type if buyer omits (plastic pellets → kg, bottles → units, metal parts → pieces).
+- target_unit_price (number): per-unit anchor price. Extract ONLY if buyer states per-unit explicitly ("under $0.50 a piece"). NEVER divide total budget by quantity.
+- budget_min (number): total budget lower bound if stated.
+- budget_max (number): total budget upper bound if stated.
+- delivery_destination (string): "City, Country" more specific than location. If buyer gives only country, still record it.
+- timeline_weeks (integer): delivery window in weeks.
+- certifications (string[]): RoHS, ISO 9001, REACH, FDA, UL, etc. Extract acronym matches only; do NOT infer from product category.
+- payment_terms (string, one of: advance | net_30 | net_60 | net_90): extract only if stated; leave null otherwise.
+- sample_required (boolean): true if buyer mentions "sample", "prototype", "swatch"; default false.
+- recurring (boolean): true if buyer says "monthly", "quarterly", "ongoing", "repeat"; default false (one-time).
+
+Return only JSON, no prose.
+
+Transcript:
+{transcript}
+"""
+
+
+def _coerce_int(v: Any) -> Optional[int]:
+    try:
+        return int(v) if v is not None and str(v).strip() != "" else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_float(v: Any) -> Optional[float]:
+    try:
+        return float(v) if v is not None and str(v).strip() != "" else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _coerce_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "1")
+    return False
+
+
+def _coerce_enum(v: Any, allowed: set) -> Optional[str]:
+    s = _coerce_str(v)
+    if s is None:
+        return None
+    s = s.lower()
+    return s if s in allowed else None
+
+
+@app.post("/parse-rfq")
+def parse_rfq(req: ParseRFQRequest):
+    client = anthropic_client()
+    if client is None:
+        return {"error": "config", "message": "ANTHROPIC_API_KEY not set"}
+    try:
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": PARSE_RFQ_PROMPT.format(transcript=req.transcript)}],
+        )
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`").split("\n", 1)[-1].rsplit("```", 1)[0]
+        raw = json.loads(text)
+    except Exception as e:
+        return {"error": "parse", "message": str(e)}
+
+    uom_allowed = {"units", "kg", "tons", "meters", "liters", "pieces"}
+    pay_allowed = {"advance", "net_30", "net_60", "net_90"}
+    certs_raw = raw.get("certifications") or []
+    certs = [s for s in (_coerce_str(c) for c in certs_raw) if s]
+
+    fields = {
+        "product_description": _coerce_str(raw.get("product_description")),
+        "product_category": _coerce_str(raw.get("product_category")),
+        "location": _coerce_str(raw.get("location")),
+        "quantity": _coerce_int(raw.get("quantity")),
+        "unit_of_measure": _coerce_enum(raw.get("unit_of_measure"), uom_allowed),
+        "target_unit_price": _coerce_float(raw.get("target_unit_price")),
+        "budget_min": _coerce_float(raw.get("budget_min")),
+        "budget_max": _coerce_float(raw.get("budget_max")),
+        "delivery_destination": _coerce_str(raw.get("delivery_destination")),
+        "timeline_weeks": _coerce_int(raw.get("timeline_weeks")),
+        "certifications": certs,
+        "payment_terms": _coerce_enum(raw.get("payment_terms"), pay_allowed),
+        "sample_required": _coerce_bool(raw.get("sample_required")),
+        "recurring": _coerce_bool(raw.get("recurring")),
+    }
+    return {"fields": fields}
+
+
 class DiscoverVendorsRequest(BaseModel):
     rfq_id: str
     location: Optional[str] = None
