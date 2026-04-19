@@ -6,10 +6,12 @@ from typing import Any, Optional
 import httpx
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client, create_client
+
+from vapi import trigger_call, handle_webhook
 
 load_dotenv()
 
@@ -379,6 +381,98 @@ def _format_poc(p: dict) -> dict:
         "linkedin": (social.get("professional_network_identifier") or {}).get("profile_url"),
         "has_business_email": bool(contact.get("has_business_email")),
     }
+
+
+class CallRequest(BaseModel):
+    assistant_id: str
+    vendor_phone: str = Field(description="E.164 format, e.g. +14155551234")
+    contact_first_name: str
+    vendor_company: str
+    buyer_company: str
+    buyer_one_liner: str
+    rfq_one_liner: str
+    preferred_process: str
+    preferred_material: str
+    target_quantity_phrase: str = Field(description="Spoken form, e.g. 'five hundred units'")
+    eau_phrase: str = Field(description="Spoken form, e.g. 'around ten thousand per year'")
+    key_constraint: str
+    required_certifications: str = Field(default="none")
+    email_followup_contact: str = Field(description="Spoken form, e.g. 'kaustubh at vendrsurf dot com'")
+    rfq_id: Optional[str] = None
+    vendor_id: Optional[str] = None
+    callback_url: Optional[str] = Field(default=None, description="URL to POST webhook results to when call events arrive")
+
+
+class CallResponse(BaseModel):
+    call_id: str
+    status: str = "triggered"
+    message: str = "Call initiated successfully"
+
+
+@app.post("/api/call", response_model=CallResponse)
+def make_call(req: CallRequest) -> CallResponse:
+    variables = {
+        "buyer_company": req.buyer_company,
+        "buyer_one_liner": req.buyer_one_liner,
+        "vendor_company": req.vendor_company,
+        "contact_first_name": req.contact_first_name,
+        "rfq_one_liner": req.rfq_one_liner,
+        "preferred_process": req.preferred_process,
+        "preferred_material": req.preferred_material,
+        "target_quantity_phrase": req.target_quantity_phrase,
+        "eau_phrase": req.eau_phrase,
+        "key_constraint": req.key_constraint,
+        "required_certifications": req.required_certifications,
+        "email_followup_contact": req.email_followup_contact,
+    }
+    metadata: dict[str, Any] = {}
+    if req.rfq_id:
+        metadata["rfq_id"] = req.rfq_id
+    if req.vendor_id:
+        metadata["vendor_id"] = req.vendor_id
+    if req.callback_url:
+        metadata["callback_url"] = req.callback_url
+    try:
+        result = trigger_call(
+            assistant_id=req.assistant_id,
+            vendor_phone=req.vendor_phone,
+            variables=variables,
+            metadata=metadata,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Vapi API error: {e}")
+    return CallResponse(call_id=result.get("id", "unknown"))
+
+
+@app.post("/vapi/webhook")
+async def vapi_webhook(request: Request) -> dict[str, Any]:
+    payload = await request.json()
+    result = handle_webhook(payload)
+    if result is None:
+        return {"received": True}
+    callback_url = _extract_callback_url(payload)
+    if callback_url:
+        await _forward_to_callback(callback_url, result)
+    return {"received": True, "event": result.get("event")}
+
+
+def _extract_callback_url(payload: dict[str, Any]) -> Optional[str]:
+    msg = payload.get("message", payload)
+    call = msg.get("call", {})
+    metadata = call.get("metadata") or {}
+    return metadata.get("callback_url")
+
+
+async def _forward_to_callback(url: str, data: dict[str, Any]) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json=data)
+    except Exception:
+        pass
 
 
 @app.post("/discover-vendors")
