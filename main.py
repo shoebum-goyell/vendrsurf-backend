@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import uuid
 from typing import Any, Optional
 
@@ -645,6 +646,12 @@ def _persist_call_event(payload: dict[str, Any], result: dict[str, Any]) -> None
             update["summary"] = result["summary"]
         if result.get("duration_seconds") is not None:
             update["call_duration"] = f"{int(result['duration_seconds'])}s"
+        if result.get("transcript"):
+            update["transcript"] = result["transcript"]
+        if result.get("recording_url"):
+            update["recording_url"] = result["recording_url"]
+        if result.get("vendor_email_captured"):
+            update["email"] = result["vendor_email_captured"]
         try:
             sb.table("vendors").update(update).eq("id", vendor_id).execute()
         except Exception:
@@ -675,6 +682,62 @@ async def _forward_to_callback(url: str, data: dict[str, Any]) -> None:
         pass
 
 
+# GLD-21: dummy outreach data for demo. Only the first vendor gets a real call;
+# the rest are populated with plausible synthetic state so the dashboard looks alive.
+_DUMMY_STATUSES = ["responded", "qualified", "quoted", "no-response", "declined"]
+_DUMMY_OUTCOMES = {
+    "responded": "Interested, awaiting quote",
+    "qualified": "Capability confirmed, moving to quote",
+    "quoted": "Formal quote received",
+    "no-response": "No callback after 2 attempts",
+    "declined": "Capacity full this quarter",
+}
+_DUMMY_SUMMARIES = {
+    "responded": "Spoke with sales lead — said they handle this volume regularly and will send a written quote within 48 hours.",
+    "qualified": "Confirmed they have in-house tooling for the spec. Lead engineer to follow up with a tech callback to nail down tolerances.",
+    "quoted": "Quote received: pricing competitive, lead time aligned. Open to negotiation on payment terms.",
+    "no-response": "Two voicemails left, follow-up email sent. No callback yet — agent will retry mid-week.",
+    "declined": "Politely declined: production line booked through Q3. Suggested checking back in 8 weeks.",
+}
+
+
+def _populate_dummy_vendor(row: dict, rfq: DiscoverVendorsRequest) -> dict:
+    rng = random.Random(row["id"])  # deterministic per vendor id
+    status = rng.choice(_DUMMY_STATUSES)
+    contact = dict(row.get("contact") or {})
+    if not contact.get("name"):
+        contact["name"] = rng.choice(["Alex Chen", "Priya Shah", "Marco Rossi", "Sam Patel", "Rin Tanaka", "Dana Klein"])
+    if not contact.get("title"):
+        contact["title"] = rng.choice(["Sales Director", "Head of BD", "Procurement Lead", "Account Executive"])
+    contact["email"] = _dummy_email_seeded(rng, row["name"])
+    contact["phone"] = _dummy_phone_seeded(rng)
+    row["contact"] = contact
+    row["status"] = status
+    row["email"] = contact["email"]
+    if status in ("quoted", "qualified", "responded"):
+        lo = rfq.budget_min or 20.0
+        hi = rfq.budget_max or max(lo * 1.6, lo + 10)
+        row["unit_price"] = round(rng.uniform(lo, hi), 2)
+        row["lead_time"] = rng.choice([3, 4, 5, 6, 8, 10, 12]) if rfq.timeline_weeks is None else rng.randint(max(1, rfq.timeline_weeks - 2), rfq.timeline_weeks + 4)
+        row["payment_terms"] = rng.choice(["net_30", "net_60", "advance"])
+    if status != "no-response":
+        row["call_duration"] = f"{rng.randint(120, 480)}s"
+    row["call_outcome"] = _DUMMY_OUTCOMES[status]
+    row["summary"] = _DUMMY_SUMMARIES[status]
+    return row
+
+
+def _dummy_email_seeded(rng: random.Random, name: str) -> str:
+    base = "".join(c.lower() for c in name if c.isalnum())[:18] or "info"
+    handle = rng.choice(["sales", "procurement", "info", "contact", "sourcing"])
+    return f"{handle}@{base}.com"
+
+
+def _dummy_phone_seeded(rng: random.Random) -> str:
+    area = rng.choice(["415", "650", "408", "212", "312", "617"])
+    return f"+1{area}{rng.randint(2000000, 9999999)}"
+
+
 @app.post("/discover-vendors")
 def discover_vendors(req: DiscoverVendorsRequest):
     if not CRUST_DATA_API_KEY:
@@ -694,7 +757,7 @@ def discover_vendors(req: DiscoverVendorsRequest):
             companies = search_companies_multi(client, categories, specialities, req.location, headcount)
 
             vendors_out = []
-            for c in companies:
+            for idx, c in enumerate(companies):
                 basic = c.get("basic_info", {}) or {}
                 loc = c.get("locations", {}) or {}
                 headcount_info = c.get("headcount", {}) or {}
@@ -712,6 +775,10 @@ def discover_vendors(req: DiscoverVendorsRequest):
                     "contact": contact,
                     "status": "discovered",
                 }
+                # GLD-21: only the first vendor gets the real call. Others get
+                # synthetic outreach state so the demo dashboard looks alive.
+                if idx > 0:
+                    _populate_dummy_vendor(row, req)
                 sb.table("vendors").upsert(row).execute()
                 vendors_out.append(row)
 

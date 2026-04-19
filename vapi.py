@@ -288,8 +288,9 @@ def _handle_end_of_call_report(msg: dict[str, Any]) -> dict[str, Any]:
         "ended_reason": msg.get("endedReason"),  # "customer-ended-call", etc.
         "duration_seconds": msg.get("durationSeconds"),
         "cost_usd": msg.get("cost"),
-        "recording_url": msg.get("recordingUrl"),
+        "recording_url": msg.get("recordingUrl") or msg.get("stereoRecordingUrl"),
         "transcript": msg.get("transcript"),
+        "messages": msg.get("messages") or [],
         "summary": analysis.get("summary"),
         "success": analysis.get("successEvaluation"),
         # Structured fields — flatten into the top-level update
